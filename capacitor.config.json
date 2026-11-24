@@ -1,0 +1,8 @@
+{
+  "appId": "com.phlagon.songbook",
+  "appName": "Malayalam Christian Hymns",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}
