@@ -4,13 +4,14 @@ import {
   RAW_URL,
   isGitHubConfigured,
 } from '../config/github';
+import type { Song as SongRecord } from '../data/songsData';
+import { extractSongsFromTsFile, isValidSongRecordList } from './songsDataCodec';
 
-export const CACHED_SONGS_KEY = 'cached_songs_txt';
+export const SYNCED_SONGS_KEY = 'synced_songs';
 export const GITHUB_TOKEN_KEY = 'github_pat_token';
 
 /**
- * Encodes a UTF-8 string (including Malayalam Unicode) to Base64 using TextEncoder.
- * Processes bytes in chunks so large songbooks never overflow the call stack.
+ * Encodes UTF-8 text (including Malayalam Unicode) to Base64 using TextEncoder.
  */
 export function utf8ToBase64(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -40,20 +41,22 @@ export function base64ToUtf8(base64: string): string {
   return new TextDecoder('utf-8').decode(bytes);
 }
 
-export function readCachedSongsTxt(): string | null {
+export function readSyncedSongs(): SongRecord[] | null {
   try {
-    const cached = localStorage.getItem(CACHED_SONGS_KEY);
-    return cached && cached.includes('INDEX') ? cached : null;
+    const raw = localStorage.getItem(SYNCED_SONGS_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isValidSongRecordList(parsed) ? parsed : null;
   } catch {
     return null;
   }
 }
 
-export function writeCachedSongsTxt(content: string): void {
+export function writeSyncedSongs(songs: SongRecord[]): void {
   try {
-    localStorage.setItem(CACHED_SONGS_KEY, content);
+    localStorage.setItem(SYNCED_SONGS_KEY, JSON.stringify(songs));
   } catch {
-    // Ignore storage quota / private mode errors
+    // Ignore storage quota or private browsing errors
   }
 }
 
@@ -79,10 +82,10 @@ export function writeStoredGitHubToken(token: string): void {
 }
 
 /**
- * Silently fetches the latest songs.txt from raw.githubusercontent.com.
- * Returns null if offline, unconfigured, or if the response does not contain INDEX.
+ * Silently fetches src/data/songsData.ts from GitHub Raw URL and extracts INITIAL_SONGS.
+ * Returns null silently when offline or if parsing fails.
  */
-export async function fetchRawSongsFromGitHub(): Promise<string | null> {
+export async function fetchRawSongsFromGitHub(): Promise<SongRecord[] | null> {
   if (!isGitHubConfigured()) {
     return null;
   }
@@ -94,13 +97,9 @@ export async function fetchRawSongsFromGitHub(): Promise<string | null> {
     if (!response.ok) {
       return null;
     }
-    const text = await response.text();
-    if (!text.includes('INDEX')) {
-      return null;
-    }
-    return text;
+    const tsText = await response.text();
+    return extractSongsFromTsFile(tsText);
   } catch {
-    // Fail silently when offline or unreachable
     return null;
   }
 }
@@ -111,12 +110,12 @@ export interface GitHubFileSnapshot {
 }
 
 /**
- * Fetches the latest file SHA and UTF-8 content from the GitHub Contents API.
+ * Fetches the latest SHA and UTF-8 content of src/data/songsData.ts from GitHub Contents API.
  */
 export async function fetchGitHubSongsFile(token: string): Promise<GitHubFileSnapshot> {
   if (!isGitHubConfigured()) {
     throw new Error(
-      'GitHub repository is not configured yet. Set GITHUB_OWNER and GITHUB_REPO in src/config/github.ts.'
+      'GitHub repository is not configured. Set GITHUB_OWNER and GITHUB_REPO in src/config/github.ts.'
     );
   }
 
@@ -157,7 +156,6 @@ export async function fetchGitHubSongsFile(token: string): Promise<GitHubFileSna
   const data = (await response.json()) as {
     sha?: string;
     content?: string;
-    encoding?: string;
   };
 
   const decodedContent =
@@ -172,9 +170,9 @@ export async function fetchGitHubSongsFile(token: string): Promise<GitHubFileSna
 }
 
 /**
- * Commits updated songs.txt content directly to the configured GitHub repository via PUT.
+ * Commits updated src/data/songsData.ts directly to GitHub via PUT with UTF-8 Base64 encoding.
  */
-export async function commitSongsTxtToGitHub(params: {
+export async function commitSongsToGitHub(params: {
   token: string;
   content: string;
   sha: string | null;
@@ -182,7 +180,7 @@ export async function commitSongsTxtToGitHub(params: {
 }): Promise<{ commitSha?: string }> {
   if (!isGitHubConfigured()) {
     throw new Error(
-      'GitHub repository is not configured yet. Set GITHUB_OWNER and GITHUB_REPO in src/config/github.ts.'
+      'GitHub repository is not configured. Set GITHUB_OWNER and GITHUB_REPO in src/config/github.ts.'
     );
   }
 
@@ -221,7 +219,7 @@ export async function commitSongsTxtToGitHub(params: {
     const errBody = (await response.json().catch(() => ({}))) as { message?: string };
     if (response.status === 409) {
       throw new Error(
-        'Conflict: songs.txt was updated elsewhere on GitHub. Please try saving again.'
+        'Conflict: src/data/songsData.ts was updated elsewhere on GitHub. Please try saving again.'
       );
     }
     if (response.status === 401 || response.status === 403) {
@@ -239,3 +237,6 @@ export async function commitSongsTxtToGitHub(params: {
 
   return { commitSha: data.commit?.sha };
 }
+
+export const commitSongsTxtToGitHub = commitSongsToGitHub;
+export const commitSongsDataToGitHub = commitSongsToGitHub;

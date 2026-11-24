@@ -3,13 +3,14 @@ import { Header } from './components/Header';
 import { MasterAdminView } from './components/MasterAdminView';
 import { SongDetailView } from './components/SongDetailView';
 import { SongIndexView } from './components/SongIndexView';
-import type { Song } from './types/song';
+import { INITIAL_SONGS } from './data/songsData';
+import type { Song as SongRecord } from './data/songsData';
 import {
   fetchRawSongsFromGitHub,
-  readCachedSongsTxt,
-  writeCachedSongsTxt,
+  readSyncedSongs,
+  writeSyncedSongs,
 } from './utils/githubSync';
-import { parseSongsFile } from './utils/parseSongs';
+import { toViewSongs } from './utils/songsDataCodec';
 
 const DEFAULT_FONT_SIZE = 20;
 const MIN_FONT_SIZE = 16;
@@ -64,72 +65,44 @@ function getInitialFontSize(): number {
 }
 
 export default function App() {
-  const [rawSongsTxt, setRawSongsTxt] = useState<string>(() => readCachedSongsTxt() ?? '');
-  const [songs, setSongs] = useState<Song[]>(() => {
-    const cached = readCachedSongsTxt();
-    return cached ? parseSongsFile(cached).songs : [];
-  });
-  const [loading, setLoading] = useState<boolean>(() => !readCachedSongsTxt());
-  const [error, setError] = useState<string | null>(null);
+  // Immediately hydrate synchronously from localStorage('synced_songs') or bundled INITIAL_SONGS (zero blank screen offline)
+  const [songRecords, setSongRecords] = useState<SongRecord[]>(
+    () => readSyncedSongs() ?? INITIAL_SONGS
+  );
   const [route, setRoute] = useState<AppRoute>(() => getRouteFromUrl());
   const [masterAuthToken, setMasterAuthToken] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [isDark, setIsDark] = useState<boolean>(() => getInitialTheme());
   const [fontSize, setFontSize] = useState<number>(() => getInitialFontSize());
 
+  const songs = useMemo(() => toViewSongs(songRecords), [songRecords]);
   const activeSongNumber = route.view === 'song' ? route.songNumber : null;
 
-  const applySongsContent = useCallback((content: string, persistToCache: boolean) => {
-    if (persistToCache) {
-      writeCachedSongsTxt(content);
-    }
-    setRawSongsTxt(content);
-    setSongs(parseSongsFile(content).songs);
-    setError(null);
-    setLoading(false);
+  const applySyncedSongs = useCallback((nextRecords: SongRecord[]) => {
+    writeSyncedSongs(nextRecords);
+    setSongRecords(nextRecords);
   }, []);
 
-  // Load bundled local /songs.txt when no cached copy exists yet (works offline in Web & Capacitor APK)
-  const loadBundledSongs = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      let response = await fetch('/songs.txt', { cache: 'no-store' }).catch(() => null);
-      if (!response || !response.ok) {
-        response = await fetch('./songs.txt', { cache: 'no-store' });
-      }
-      if (!response.ok) {
-        throw new Error(`Could not load songs.txt (HTTP ${response.status}).`);
-      }
-      const text = await response.text();
-      applySongsContent(text, false);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : 'Unable to load songs.txt. Please ensure public/songs.txt exists.'
-      );
-      setLoading(false);
-    }
-  }, [applySongsContent]);
-
-  // Silently sync latest songs.txt from GitHub Raw URL on startup and when returning online
+  // Silently fetch latest src/data/songsData.ts from GitHub Raw URL on startup and on 'online'
   const syncSongsFromGitHub = useCallback(async () => {
-    const fetchedText = await fetchRawSongsFromGitHub();
-    if (!fetchedText) {
+    const fetched = await fetchRawSongsFromGitHub();
+    if (!fetched) {
       return;
     }
 
-    const currentCached = readCachedSongsTxt();
-    if (fetchedText !== currentCached) {
-      applySongsContent(fetchedText, true);
+    const fetchedJson = JSON.stringify(fetched);
+    const currentSynced = readSyncedSongs();
+    const currentJson = JSON.stringify(currentSynced ?? INITIAL_SONGS);
+
+    if (fetchedJson !== currentJson || !currentSynced) {
+      writeSyncedSongs(fetched);
+      if (fetchedJson !== currentJson) {
+        setSongRecords(fetched);
+      }
     }
-  }, [applySongsContent]);
+  }, []);
 
   useEffect(() => {
-    if (!readCachedSongsTxt()) {
-      loadBundledSongs();
-    }
     syncSongsFromGitHub();
 
     const handleOnline = () => {
@@ -137,7 +110,7 @@ export default function App() {
     };
     window.addEventListener('online', handleOnline);
     return () => window.removeEventListener('online', handleOnline);
-  }, [loadBundledSongs, syncSongsFromGitHub]);
+  }, [syncSongsFromGitHub]);
 
   // Keep Tailwind dark class and localStorage synced
   useEffect(() => {
@@ -222,35 +195,13 @@ export default function App() {
       />
 
       <div className="flex-1">
-        {loading ? (
-          <main className="max-w-4xl mx-auto px-5 sm:px-8 py-16">
-            <p className="text-base text-stone-500 dark:text-stone-400">Loading songs…</p>
-          </main>
-        ) : error ? (
-          <main className="max-w-4xl mx-auto px-5 sm:px-8 py-16">
-            <div className="max-w-lg">
-              <h1 className="font-editorial text-xl font-semibold text-[#1C1917] dark:text-[#F4F1EA]">
-                Unable to Load Songs
-              </h1>
-              <p className="text-sm text-stone-600 dark:text-stone-400 mt-2 leading-relaxed">
-                {error}
-              </p>
-              <button
-                type="button"
-                onClick={loadBundledSongs}
-                className="mt-5 px-4 py-2 min-h-[40px] text-sm font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-[#1C1917] dark:text-[#F4F1EA] hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 cursor-pointer"
-              >
-                Retry
-              </button>
-            </div>
-          </main>
-        ) : route.view === 'master' ? (
+        {route.view === 'master' ? (
           <MasterAdminView
             songs={songs}
-            rawSongsTxt={rawSongsTxt}
+            songRecords={songRecords}
             authToken={masterAuthToken}
             onAuthTokenChange={setMasterAuthToken}
-            onSongsContentUpdated={(content) => applySongsContent(content, true)}
+            onSongsUpdated={applySyncedSongs}
             onBackToIndex={() => navigateToIndex(false)}
             onOpenSong={navigateToSong}
           />
@@ -279,7 +230,7 @@ export default function App() {
                 Song {activeSongNumber} Not Found
               </h1>
               <p className="text-sm text-stone-600 dark:text-stone-400 mt-2">
-                This song number is not currently listed in <code className="font-mono">songs.txt</code>.
+                This song number is not currently listed in the songbook.
               </p>
               <button
                 type="button"

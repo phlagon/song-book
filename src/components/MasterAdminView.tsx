@@ -18,28 +18,28 @@ import {
   GITHUB_REPO,
   isGitHubConfigured,
 } from '../config/github';
+import type { Song as SongRecord } from '../data/songsData';
 import type { Song } from '../types/song';
+import { extractDefaultTitleFromLyrics } from '../utils/formatSongEntry';
 import {
-  appendSongToSongsTxt,
-  deleteSongFromSongsTxt,
-  extractDefaultTitleFromLyrics,
-  getNextSongNumber,
-  updateSongInSongsTxt,
-} from '../utils/formatSongEntry';
-import {
-  commitSongsTxtToGitHub,
+  commitSongsDataToGitHub,
   fetchGitHubSongsFile,
   readStoredGitHubToken,
   writeStoredGitHubToken,
 } from '../utils/githubSync';
-import { parseSongsFile } from '../utils/parseSongs';
+import {
+  extractSongsFromTsFile,
+  generateSongsDataTs,
+  reindexSongs,
+  sanitizeSongRecord,
+} from '../utils/songsDataCodec';
 
 interface MasterAdminViewProps {
   songs: Song[];
-  rawSongsTxt: string;
+  songRecords: SongRecord[];
   authToken: string | null;
   onAuthTokenChange: (token: string | null) => void;
-  onSongsContentUpdated: (updatedContent: string) => void;
+  onSongsUpdated: (updatedRecords: SongRecord[]) => void;
   onBackToIndex: () => void;
   onOpenSong: (songNumber: number) => void;
 }
@@ -48,10 +48,10 @@ type AuthMode = 'checking' | 'setup' | 'login' | 'authenticated' | 'static-ready
 
 export function MasterAdminView({
   songs,
-  rawSongsTxt,
+  songRecords,
   authToken,
   onAuthTokenChange,
-  onSongsContentUpdated,
+  onSongsUpdated,
   onBackToIndex,
   onOpenSong,
 }: MasterAdminViewProps) {
@@ -62,8 +62,8 @@ export function MasterAdminView({
   const [authSubmitting, setAuthSubmitting] = useState(false);
 
   const [githubToken, setGithubToken] = useState<string>(() => readStoredGitHubToken());
-  const [editingSongNumber, setEditingSongNumber] = useState<number | null>(null);
-  const [confirmDeleteNumber, setConfirmDeleteNumber] = useState<number | null>(null);
+  const [editingSongId, setEditingSongId] = useState<number | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
 
   const [lyrics, setLyrics] = useState('');
   const [title, setTitle] = useState('');
@@ -80,14 +80,9 @@ export function MasterAdminView({
 
   const repoConfigured = isGitHubConfigured();
 
-  const nextSongNumber = useMemo(
-    () => getNextSongNumber(songs.map((s) => s.number)),
-    [songs]
-  );
+  const nextSongNumber = useMemo(() => songRecords.length + 1, [songRecords.length]);
+  const displaySongNumber = editingSongId ?? nextSongNumber;
 
-  const displaySongNumber = editingSongNumber ?? nextSongNumber;
-
-  // Check server auth configuration when backend is available; allow direct GitHub PAT access in static / Capacitor builds
   useEffect(() => {
     let cancelled = false;
 
@@ -145,7 +140,7 @@ export function MasterAdminView({
   };
 
   const resetForm = () => {
-    setEditingSongNumber(null);
+    setEditingSongId(null);
     setLyrics('');
     setTitle('');
     setTitleManuallyEdited(false);
@@ -154,12 +149,12 @@ export function MasterAdminView({
   };
 
   const handleStartEdit = (song: Song) => {
-    setEditingSongNumber(song.number);
+    setEditingSongId(song.number);
     setTitle(song.title);
     setTitleManuallyEdited(true);
     setLyricist(song.lyricist);
     setLyrics(song.lyrics);
-    setConfirmDeleteNumber(null);
+    setConfirmDeleteId(null);
     setActionError(null);
     setStatusMessage(null);
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -168,7 +163,7 @@ export function MasterAdminView({
   const handleLyricsChange = (nextLyrics: string) => {
     setLyrics(nextLyrics);
     setActionError(null);
-    if (!titleManuallyEdited && editingSongNumber === null) {
+    if (!titleManuallyEdited && editingSongId === null) {
       setTitle(extractDefaultTitleFromLyrics(nextLyrics));
     }
   };
@@ -279,51 +274,83 @@ export function MasterAdminView({
       setActionError('Please enter a song title.');
       return;
     }
-    if (/^\s*\*{0,3}\[\s*END\s+OF\s+SONG\s+\d+\s*\]\*{0,3}\s*$/im.test(effectiveLyrics)) {
-      setActionError(
-        'Lyrics must not include an [END OF SONG X] marker; it is added automatically.'
-      );
-      return;
-    }
 
     setBusy(true);
     try {
       const snapshot = await fetchGitHubSongsFile(githubToken);
-      const baseContent = snapshot.content || rawSongsTxt;
+      const remoteSongs = snapshot.content
+        ? extractSongsFromTsFile(snapshot.content)
+        : null;
 
+      if (snapshot.content && !remoteSongs) {
+        throw new Error(
+          'Could not parse INITIAL_SONGS from src/data/songsData.ts on GitHub. Check file syntax before committing.'
+        );
+      }
+
+      const baseSongs = remoteSongs ?? songRecords;
+      let nextList: SongRecord[];
       let targetNumber: number;
-      let updatedContent: string;
       let commitMessage: string;
 
-      if (editingSongNumber !== null) {
-        targetNumber = editingSongNumber;
-        updatedContent = updateSongInSongsTxt(baseContent, {
-          number: targetNumber,
-          title: effectiveTitle,
-          lyricist: effectiveLyricist,
-          lyrics: effectiveLyrics,
+      if (editingSongId !== null) {
+        targetNumber = editingSongId;
+        let updatedExisting = false;
+        const mapped = baseSongs.map((item) => {
+          if (item.id === editingSongId) {
+            updatedExisting = true;
+            return sanitizeSongRecord({
+              id: editingSongId,
+              title: effectiveTitle,
+              lyricist: effectiveLyricist,
+              lyrics: effectiveLyrics,
+            });
+          }
+          return item;
         });
+
+        if (!updatedExisting) {
+          mapped.push(
+            sanitizeSongRecord({
+              id: editingSongId,
+              title: effectiveTitle,
+              lyricist: effectiveLyricist,
+              lyrics: effectiveLyrics,
+            })
+          );
+        }
+
+        nextList = reindexSongs(mapped);
+        targetNumber =
+          nextList.find(
+            (s) => s.title === effectiveTitle && s.lyrics === effectiveLyrics
+          )?.id ?? editingSongId;
         commitMessage = `Update Song ${targetNumber}: ${effectiveTitle}`;
       } else {
-        const latestParsed = parseSongsFile(baseContent);
-        targetNumber = getNextSongNumber(latestParsed.songs.map((s) => s.number));
-        updatedContent = appendSongToSongsTxt(baseContent, {
-          number: targetNumber,
-          title: effectiveTitle,
-          lyricist: effectiveLyricist,
-          lyrics: effectiveLyrics,
-        });
+        const reindexedBase = reindexSongs(baseSongs);
+        targetNumber = reindexedBase.length + 1;
+        nextList = [
+          ...reindexedBase,
+          sanitizeSongRecord({
+            id: targetNumber,
+            title: effectiveTitle,
+            lyricist: effectiveLyricist,
+            lyrics: effectiveLyrics,
+          }),
+        ];
         commitMessage = `Add Song ${targetNumber}: ${effectiveTitle}`;
       }
 
-      await commitSongsTxtToGitHub({
+      const updatedTsContent = generateSongsDataTs(nextList);
+
+      await commitSongsDataToGitHub({
         token: githubToken,
-        content: updatedContent,
+        content: updatedTsContent,
         sha: snapshot.sha,
         message: commitMessage,
       });
 
-      onSongsContentUpdated(updatedContent);
+      onSongsUpdated(nextList);
       setStatusMessage({
         text: `Saved & Pushed to GitHub — Song ${targetNumber} (${effectiveTitle})`,
         songNumber: targetNumber,
@@ -333,7 +360,7 @@ export function MasterAdminView({
       setActionError(
         err instanceof Error
           ? err.message
-          : 'Failed to push changes to GitHub. You can use "Download songs.txt" as a fallback.'
+          : 'Failed to push changes to GitHub. You can use "Download songsData.ts" as a fallback.'
       );
     } finally {
       setBusy(false);
@@ -348,80 +375,90 @@ export function MasterAdminView({
 
     try {
       const snapshot = await fetchGitHubSongsFile(githubToken);
-      const baseContent = snapshot.content || rawSongsTxt;
-      const updatedContent = deleteSongFromSongsTxt(baseContent, song.number);
+      const remoteSongs = snapshot.content
+        ? extractSongsFromTsFile(snapshot.content)
+        : null;
 
-      await commitSongsTxtToGitHub({
+      if (snapshot.content && !remoteSongs) {
+        throw new Error(
+          'Could not parse INITIAL_SONGS from src/data/songsData.ts on GitHub.'
+        );
+      }
+
+      const baseSongs = remoteSongs ?? songRecords;
+      const remaining = reindexSongs(baseSongs.filter((item) => item.id !== song.number));
+      const updatedTsContent = generateSongsDataTs(remaining);
+
+      await commitSongsDataToGitHub({
         token: githubToken,
-        content: updatedContent,
+        content: updatedTsContent,
         sha: snapshot.sha,
         message: `Delete Song ${song.number}: ${song.title}`,
       });
 
-      onSongsContentUpdated(updatedContent);
-      setConfirmDeleteNumber(null);
-      if (editingSongNumber === song.number) {
+      onSongsUpdated(remaining);
+      setConfirmDeleteId(null);
+      if (editingSongId === song.number) {
         resetForm();
       }
       setStatusMessage({
-        text: `Saved & Pushed to GitHub — Deleted Song ${song.number}`,
+        text: `Saved & Pushed to GitHub — Deleted Song ${song.number} and re-indexed songs`,
       });
     } catch (err) {
       setActionError(
-        err instanceof Error
-          ? err.message
-          : 'Failed to delete song on GitHub.'
+        err instanceof Error ? err.message : 'Failed to delete song on GitHub.'
       );
     } finally {
       setBusy(false);
     }
   };
 
-  const handleDownloadBackup = async () => {
+  const handleDownloadBackup = () => {
     setDownloadNotice(null);
     setActionError(null);
 
     try {
-      let currentText = rawSongsTxt;
-      if (!currentText) {
-        const res = await fetch('/songs.txt', { cache: 'no-store' });
-        if (!res.ok) {
-          throw new Error('Could not read current songs.txt.');
-        }
-        currentText = await res.text();
-      }
-
       const draftLyrics = lyrics.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
       const draftTitle = (title.trim() || extractDefaultTitleFromLyrics(draftLyrics)).trim();
 
-      let contentToDownload = currentText;
-      let message = 'Downloaded current songs.txt.';
+      let recordsToExport = reindexSongs(songRecords);
+      let message = 'Downloaded current src/data/songsData.ts.';
 
       if (draftLyrics && draftTitle) {
-        if (editingSongNumber !== null) {
-          contentToDownload = updateSongInSongsTxt(currentText, {
-            number: editingSongNumber,
-            title: draftTitle,
-            lyricist: lyricist.trim() || 'Traditional',
-            lyrics: draftLyrics,
-          });
-          message = `Downloaded songs.txt with edited Song ${editingSongNumber} included.`;
+        if (editingSongId !== null) {
+          recordsToExport = reindexSongs(
+            songRecords.map((item) =>
+              item.id === editingSongId
+                ? sanitizeSongRecord({
+                    id: editingSongId,
+                    title: draftTitle,
+                    lyricist: lyricist.trim() || 'Traditional',
+                    lyrics: draftLyrics,
+                  })
+                : item
+            )
+          );
+          message = `Downloaded songsData.ts with edited Song ${editingSongId} included.`;
         } else {
-          contentToDownload = appendSongToSongsTxt(currentText, {
-            number: nextSongNumber,
-            title: draftTitle,
-            lyricist: lyricist.trim() || 'Traditional',
-            lyrics: draftLyrics,
-          });
-          message = `Downloaded songs.txt with draft Song ${nextSongNumber} included.`;
+          recordsToExport = [
+            ...recordsToExport,
+            sanitizeSongRecord({
+              id: recordsToExport.length + 1,
+              title: draftTitle,
+              lyricist: lyricist.trim() || 'Traditional',
+              lyrics: draftLyrics,
+            }),
+          ];
+          message = `Downloaded songsData.ts with draft Song ${recordsToExport.length} included.`;
         }
       }
 
-      const blob = new Blob([contentToDownload], { type: 'text/plain;charset=utf-8' });
+      const tsContent = generateSongsDataTs(recordsToExport);
+      const blob = new Blob([tsContent], { type: 'text/typescript;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = 'songs.txt';
+      link.download = 'songsData.ts';
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -429,7 +466,7 @@ export function MasterAdminView({
 
       setDownloadNotice(message);
     } catch {
-      setActionError('Failed to generate songs.txt download.');
+      setActionError('Failed to generate songsData.ts download.');
     }
   };
 
@@ -480,7 +517,7 @@ export function MasterAdminView({
           <p className="text-sm text-stone-600 dark:text-stone-400 mt-2 leading-relaxed">
             {authMode === 'setup'
               ? 'No MASTER_ADMIN_PASSWORD secret is configured yet. Create an admin password for this session to unlock song publishing.'
-              : 'Enter the admin password to add, edit, or delete songs in your GitHub repository.'}
+              : 'Enter the admin password to add, edit, or delete songs in src/data/songsData.ts on GitHub.'}
           </p>
 
           <form
@@ -557,7 +594,7 @@ export function MasterAdminView({
         <section className="pt-8">
           <div className="pb-6 border-b border-stone-200 dark:border-stone-800">
             <h1 className="font-editorial text-2xl sm:text-3xl font-semibold text-[#1C1917] dark:text-[#F4F1EA]">
-              {editingSongNumber !== null ? `Edit Song ${editingSongNumber}` : 'Add New Song'}
+              {editingSongId !== null ? `Edit Song ${editingSongId}` : 'Add New Song'}
             </h1>
             <p className="text-sm text-stone-500 dark:text-stone-400 mt-1 tabular-nums">
               {songs.length} {songs.length === 1 ? 'song' : 'songs'} loaded
@@ -571,12 +608,11 @@ export function MasterAdminView({
           {!repoConfigured && (
             <p className="mt-5 text-sm text-stone-700 dark:text-stone-300 border border-stone-300 dark:border-stone-700 rounded-md px-4 py-3 bg-white/70 dark:bg-[#1A1918]">
               Set <code className="font-mono">GITHUB_OWNER</code> and{' '}
-              <code className="font-mono">GITHUB_REPO</code> at the top of{' '}
-              <code className="font-mono">src/config/github.ts</code> to enable direct GitHub commits and auto-sync. You can still use <strong>Download songs.txt</strong> anytime.
+              <code className="font-mono">GITHUB_REPO</code> in{' '}
+              <code className="font-mono">src/config/github.ts</code> to enable direct GitHub commits.
             </p>
           )}
 
-          {/* GitHub Personal Access Token (persisted in localStorage) */}
           <div className="mt-6 pb-6 border-b border-stone-200 dark:border-stone-800">
             <div className="flex items-baseline justify-between gap-2 mb-1.5">
               <label
@@ -746,13 +782,13 @@ export function MasterAdminView({
                 <span>
                   {busy
                     ? 'Pushing to GitHub…'
-                    : editingSongNumber !== null
-                      ? `Update Song ${editingSongNumber} on GitHub`
+                    : editingSongId !== null
+                      ? `Update Song ${editingSongId} on GitHub`
                       : `Save Song ${nextSongNumber} to GitHub`}
                 </span>
               </button>
 
-              {editingSongNumber !== null && (
+              {editingSongId !== null && (
                 <button
                   type="button"
                   onClick={resetForm}
@@ -770,24 +806,23 @@ export function MasterAdminView({
                 className="inline-flex items-center gap-2 px-4 py-2.5 min-h-[44px] text-sm font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-[#1C1917] dark:text-[#F4F1EA] hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 whitespace-nowrap cursor-pointer"
               >
                 <Download className="w-4 h-4 text-stone-500 dark:text-stone-400" aria-hidden="true" />
-                <span>Download songs.txt</span>
+                <span>Download songsData.ts</span>
               </button>
             </div>
           </form>
 
-          {/* Existing Songs — Edit or Delete Directly on GitHub */}
           {songs.length > 0 && (
             <div className="mt-12 pt-8 border-t border-stone-200 dark:border-stone-800">
               <h2 className="font-editorial text-xl font-semibold text-[#1C1917] dark:text-[#F4F1EA]">
                 Manage Existing Songs
               </h2>
               <p className="text-xs text-stone-500 dark:text-stone-400 mt-1">
-                Edit or delete a song and commit the updated songs.txt directly to GitHub.
+                Edit or delete a song and push the updated songsData.ts directly to GitHub.
               </p>
 
               <ul className="mt-4 border-y border-stone-200 dark:border-stone-800 divide-y divide-stone-200/90 dark:divide-stone-800/90">
                 {songs.map((song) => {
-                  const isDeletingThis = confirmDeleteNumber === song.number;
+                  const isDeletingThis = confirmDeleteId === song.number;
                   return (
                     <li
                       key={song.number}
@@ -819,7 +854,7 @@ export function MasterAdminView({
                             <button
                               type="button"
                               disabled={busy}
-                              onClick={() => setConfirmDeleteNumber(null)}
+                              onClick={() => setConfirmDeleteId(null)}
                               className="px-3 py-1.5 min-h-[36px] text-xs font-medium rounded-md border border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 whitespace-nowrap cursor-pointer"
                             >
                               Cancel
@@ -839,7 +874,7 @@ export function MasterAdminView({
                             <button
                               type="button"
                               disabled={busy}
-                              onClick={() => setConfirmDeleteNumber(song.number)}
+                              onClick={() => setConfirmDeleteId(song.number)}
                               className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50 transition-colors duration-150 whitespace-nowrap cursor-pointer"
                             >
                               <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />

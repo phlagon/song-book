@@ -1,7 +1,7 @@
 export const GITHUB_OWNER = 'phlagon';
 export const GITHUB_REPO = 'song-book';
 export const GITHUB_BRANCH = 'main';
-export const FILE_PATH = 'public/songs.txt';
+export const FILE_PATH = 'src/data/songsData.ts';
 
 export const RAW_URL = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${FILE_PATH}`;
 export const CONTENTS_API_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${FILE_PATH}`;
