@@ -4,6 +4,11 @@ import { MasterAdminView } from './components/MasterAdminView';
 import { SongDetailView } from './components/SongDetailView';
 import { SongIndexView } from './components/SongIndexView';
 import type { Song } from './types/song';
+import {
+  fetchRawSongsFromGitHub,
+  readCachedSongsTxt,
+  writeCachedSongsTxt,
+} from './utils/githubSync';
 import { parseSongsFile } from './utils/parseSongs';
 
 const DEFAULT_FONT_SIZE = 20;
@@ -59,8 +64,12 @@ function getInitialFontSize(): number {
 }
 
 export default function App() {
-  const [songs, setSongs] = useState<Song[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [rawSongsTxt, setRawSongsTxt] = useState<string>(() => readCachedSongsTxt() ?? '');
+  const [songs, setSongs] = useState<Song[]>(() => {
+    const cached = readCachedSongsTxt();
+    return cached ? parseSongsFile(cached).songs : [];
+  });
+  const [loading, setLoading] = useState<boolean>(() => !readCachedSongsTxt());
   const [error, setError] = useState<string | null>(null);
   const [route, setRoute] = useState<AppRoute>(() => getRouteFromUrl());
   const [masterAuthToken, setMasterAuthToken] = useState<string | null>(null);
@@ -70,37 +79,65 @@ export default function App() {
 
   const activeSongNumber = route.view === 'song' ? route.songNumber : null;
 
-  // Dynamically load and parse public/songs.txt on page load with no-store caching
-  const loadSongs = useCallback(async () => {
+  const applySongsContent = useCallback((content: string, persistToCache: boolean) => {
+    if (persistToCache) {
+      writeCachedSongsTxt(content);
+    }
+    setRawSongsTxt(content);
+    setSongs(parseSongsFile(content).songs);
+    setError(null);
+    setLoading(false);
+  }, []);
+
+  // Load bundled local /songs.txt when no cached copy exists yet (works offline in Web & Capacitor APK)
+  const loadBundledSongs = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch('/songs.txt', {
-        cache: 'no-store',
-        headers: {
-          'Cache-Control': 'no-cache',
-        },
-      });
+      let response = await fetch('/songs.txt', { cache: 'no-store' }).catch(() => null);
+      if (!response || !response.ok) {
+        response = await fetch('./songs.txt', { cache: 'no-store' });
+      }
       if (!response.ok) {
         throw new Error(`Could not load songs.txt (HTTP ${response.status}).`);
       }
       const text = await response.text();
-      const parsed = parseSongsFile(text);
-      setSongs(parsed.songs);
+      applySongsContent(text, false);
     } catch (err) {
       setError(
         err instanceof Error
           ? err.message
           : 'Unable to load songs.txt. Please ensure public/songs.txt exists.'
       );
-    } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applySongsContent]);
+
+  // Silently sync latest songs.txt from GitHub Raw URL on startup and when returning online
+  const syncSongsFromGitHub = useCallback(async () => {
+    const fetchedText = await fetchRawSongsFromGitHub();
+    if (!fetchedText) {
+      return;
+    }
+
+    const currentCached = readCachedSongsTxt();
+    if (fetchedText !== currentCached) {
+      applySongsContent(fetchedText, true);
+    }
+  }, [applySongsContent]);
 
   useEffect(() => {
-    loadSongs();
-  }, [loadSongs]);
+    if (!readCachedSongsTxt()) {
+      loadBundledSongs();
+    }
+    syncSongsFromGitHub();
+
+    const handleOnline = () => {
+      syncSongsFromGitHub();
+    };
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, [loadBundledSongs, syncSongsFromGitHub]);
 
   // Keep Tailwind dark class and localStorage synced
   useEffect(() => {
@@ -200,7 +237,7 @@ export default function App() {
               </p>
               <button
                 type="button"
-                onClick={loadSongs}
+                onClick={loadBundledSongs}
                 className="mt-5 px-4 py-2 min-h-[40px] text-sm font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-[#1C1917] dark:text-[#F4F1EA] hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 cursor-pointer"
               >
                 Retry
@@ -210,9 +247,10 @@ export default function App() {
         ) : route.view === 'master' ? (
           <MasterAdminView
             songs={songs}
+            rawSongsTxt={rawSongsTxt}
             authToken={masterAuthToken}
             onAuthTokenChange={setMasterAuthToken}
-            onSongSaved={loadSongs}
+            onSongsContentUpdated={(content) => applySongsContent(content, true)}
             onBackToIndex={() => navigateToIndex(false)}
             onOpenSong={navigateToSong}
           />

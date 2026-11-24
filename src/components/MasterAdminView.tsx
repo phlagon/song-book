@@ -1,29 +1,57 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
-import { ArrowLeft, Check, Download, Lock, LogOut, Save } from 'lucide-react';
+import {
+  ArrowLeft,
+  Check,
+  Download,
+  KeyRound,
+  Lock,
+  LogOut,
+  Pencil,
+  Save,
+  Trash2,
+} from 'lucide-react';
+import {
+  FILE_PATH,
+  GITHUB_BRANCH,
+  GITHUB_OWNER,
+  GITHUB_REPO,
+  isGitHubConfigured,
+} from '../config/github';
 import type { Song } from '../types/song';
 import {
   appendSongToSongsTxt,
+  deleteSongFromSongsTxt,
   extractDefaultTitleFromLyrics,
   getNextSongNumber,
+  updateSongInSongsTxt,
 } from '../utils/formatSongEntry';
+import {
+  commitSongsTxtToGitHub,
+  fetchGitHubSongsFile,
+  readStoredGitHubToken,
+  writeStoredGitHubToken,
+} from '../utils/githubSync';
+import { parseSongsFile } from '../utils/parseSongs';
 
 interface MasterAdminViewProps {
   songs: Song[];
+  rawSongsTxt: string;
   authToken: string | null;
   onAuthTokenChange: (token: string | null) => void;
-  onSongSaved: () => Promise<void>;
+  onSongsContentUpdated: (updatedContent: string) => void;
   onBackToIndex: () => void;
   onOpenSong: (songNumber: number) => void;
 }
 
-type AuthMode = 'checking' | 'setup' | 'login' | 'authenticated' | 'static-fallback';
+type AuthMode = 'checking' | 'setup' | 'login' | 'authenticated' | 'static-ready';
 
 export function MasterAdminView({
   songs,
+  rawSongsTxt,
   authToken,
   onAuthTokenChange,
-  onSongSaved,
+  onSongsContentUpdated,
   onBackToIndex,
   onOpenSong,
 }: MasterAdminViewProps) {
@@ -33,22 +61,33 @@ export function MasterAdminView({
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSubmitting, setAuthSubmitting] = useState(false);
 
+  const [githubToken, setGithubToken] = useState<string>(() => readStoredGitHubToken());
+  const [editingSongNumber, setEditingSongNumber] = useState<number | null>(null);
+  const [confirmDeleteNumber, setConfirmDeleteNumber] = useState<number | null>(null);
+
   const [lyrics, setLyrics] = useState('');
   const [title, setTitle] = useState('');
   const [titleManuallyEdited, setTitleManuallyEdited] = useState(false);
   const [lyricist, setLyricist] = useState('');
 
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [savedSong, setSavedSong] = useState<{ number: number; title: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<{
+    text: string;
+    songNumber?: number;
+  } | null>(null);
   const [downloadNotice, setDownloadNotice] = useState<string | null>(null);
+
+  const repoConfigured = isGitHubConfigured();
 
   const nextSongNumber = useMemo(
     () => getNextSongNumber(songs.map((s) => s.number)),
     [songs]
   );
 
-  // Check server auth configuration & validate existing in-memory session token
+  const displaySongNumber = editingSongNumber ?? nextSongNumber;
+
+  // Check server auth configuration when backend is available; allow direct GitHub PAT access in static / Capacitor builds
   useEffect(() => {
     let cancelled = false;
 
@@ -66,7 +105,7 @@ export function MasterAdminView({
         const contentType = res.headers.get('content-type') || '';
         if (!res.ok || !contentType.includes('application/json')) {
           if (!cancelled) {
-            setAuthMode('static-fallback');
+            setAuthMode('static-ready');
           }
           return;
         }
@@ -88,7 +127,7 @@ export function MasterAdminView({
         }
       } catch {
         if (!cancelled) {
-          setAuthMode('static-fallback');
+          setAuthMode('static-ready');
         }
       }
     }
@@ -99,17 +138,44 @@ export function MasterAdminView({
     };
   }, [authToken, onAuthTokenChange]);
 
+  const handleGitHubTokenChange = (value: string) => {
+    setGithubToken(value);
+    writeStoredGitHubToken(value);
+    setActionError(null);
+  };
+
+  const resetForm = () => {
+    setEditingSongNumber(null);
+    setLyrics('');
+    setTitle('');
+    setTitleManuallyEdited(false);
+    setLyricist('');
+    setActionError(null);
+  };
+
+  const handleStartEdit = (song: Song) => {
+    setEditingSongNumber(song.number);
+    setTitle(song.title);
+    setTitleManuallyEdited(true);
+    setLyricist(song.lyricist);
+    setLyrics(song.lyrics);
+    setConfirmDeleteNumber(null);
+    setActionError(null);
+    setStatusMessage(null);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   const handleLyricsChange = (nextLyrics: string) => {
     setLyrics(nextLyrics);
-    setSaveError(null);
-    if (!titleManuallyEdited) {
+    setActionError(null);
+    if (!titleManuallyEdited && editingSongNumber === null) {
       setTitle(extractDefaultTitleFromLyrics(nextLyrics));
     }
   };
 
   const handleTitleChange = (nextTitle: string) => {
     setTitle(nextTitle);
-    setSaveError(null);
+    setActionError(null);
     setTitleManuallyEdited(nextTitle.trim().length > 0);
   };
 
@@ -195,95 +261,135 @@ export function MasterAdminView({
 
   const handleSaveSong = async (e: FormEvent) => {
     e.preventDefault();
-    setSaveError(null);
-    setSavedSong(null);
+    setActionError(null);
+    setStatusMessage(null);
+    setDownloadNotice(null);
 
-    const effectiveTitle = (title.trim() || extractDefaultTitleFromLyrics(lyrics)).trim();
-    const effectiveLyricist = lyricist.trim() || 'Traditional';
     const effectiveLyrics = lyrics.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
+    const effectiveTitle = (title.trim() || extractDefaultTitleFromLyrics(effectiveLyrics))
+      .replace(/[\r\n]+/g, ' ')
+      .trim();
+    const effectiveLyricist = lyricist.replace(/[\r\n]+/g, ' ').trim() || 'Traditional';
 
     if (!effectiveLyrics) {
-      setSaveError('Please enter the song lyrics.');
+      setActionError('Please enter the song lyrics.');
       return;
     }
-
     if (!effectiveTitle) {
-      setSaveError('Please enter a song title.');
+      setActionError('Please enter a song title.');
       return;
     }
-
-    if (authMode === 'static-fallback') {
-      setSaveError(
-        'Direct server saving is unavailable on static hosting. Use "Download songs.txt" below to save a copy with this song included.'
+    if (/^\s*\*{0,3}\[\s*END\s+OF\s+SONG\s+\d+\s*\]\*{0,3}\s*$/im.test(effectiveLyrics)) {
+      setActionError(
+        'Lyrics must not include an [END OF SONG X] marker; it is added automatically.'
       );
       return;
     }
 
-    setSaving(true);
+    setBusy(true);
     try {
-      const res = await fetch('/api/songs', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
-        body: JSON.stringify({
+      const snapshot = await fetchGitHubSongsFile(githubToken);
+      const baseContent = snapshot.content || rawSongsTxt;
+
+      let targetNumber: number;
+      let updatedContent: string;
+      let commitMessage: string;
+
+      if (editingSongNumber !== null) {
+        targetNumber = editingSongNumber;
+        updatedContent = updateSongInSongsTxt(baseContent, {
+          number: targetNumber,
           title: effectiveTitle,
           lyricist: effectiveLyricist,
           lyrics: effectiveLyrics,
-        }),
+        });
+        commitMessage = `Update Song ${targetNumber}: ${effectiveTitle}`;
+      } else {
+        const latestParsed = parseSongsFile(baseContent);
+        targetNumber = getNextSongNumber(latestParsed.songs.map((s) => s.number));
+        updatedContent = appendSongToSongsTxt(baseContent, {
+          number: targetNumber,
+          title: effectiveTitle,
+          lyricist: effectiveLyricist,
+          lyrics: effectiveLyrics,
+        });
+        commitMessage = `Add Song ${targetNumber}: ${effectiveTitle}`;
+      }
+
+      await commitSongsTxtToGitHub({
+        token: githubToken,
+        content: updatedContent,
+        sha: snapshot.sha,
+        message: commitMessage,
       });
 
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        setSaveError(
-          'Save endpoint is unavailable in this environment. Use "Download songs.txt" below as a backup.'
-        );
-        return;
-      }
-
-      const data = (await res.json()) as {
-        song?: { number: number; title: string; lyricist: string };
-        error?: string;
-      };
-
-      if (res.status === 401) {
-        onAuthTokenChange(null);
-        setAuthMode('login');
-        setAuthError(data.error || 'Session expired. Please sign in again.');
-        return;
-      }
-
-      if (!res.ok || !data.song) {
-        setSaveError(data.error || 'Could not save the song to songs.txt.');
-        return;
-      }
-
-      await onSongSaved();
-      setSavedSong({ number: data.song.number, title: data.song.title });
-      setLyrics('');
-      setTitle('');
-      setTitleManuallyEdited(false);
-      setLyricist('');
-    } catch {
-      setSaveError(
-        'Could not reach /api/songs. You can use "Download songs.txt" below as a static backup.'
+      onSongsContentUpdated(updatedContent);
+      setStatusMessage({
+        text: `Saved & Pushed to GitHub — Song ${targetNumber} (${effectiveTitle})`,
+        songNumber: targetNumber,
+      });
+      resetForm();
+    } catch (err) {
+      setActionError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to push changes to GitHub. You can use "Download songs.txt" as a fallback.'
       );
     } finally {
-      setSaving(false);
+      setBusy(false);
+    }
+  };
+
+  const handleDeleteSong = async (song: Song) => {
+    setActionError(null);
+    setStatusMessage(null);
+    setDownloadNotice(null);
+    setBusy(true);
+
+    try {
+      const snapshot = await fetchGitHubSongsFile(githubToken);
+      const baseContent = snapshot.content || rawSongsTxt;
+      const updatedContent = deleteSongFromSongsTxt(baseContent, song.number);
+
+      await commitSongsTxtToGitHub({
+        token: githubToken,
+        content: updatedContent,
+        sha: snapshot.sha,
+        message: `Delete Song ${song.number}: ${song.title}`,
+      });
+
+      onSongsContentUpdated(updatedContent);
+      setConfirmDeleteNumber(null);
+      if (editingSongNumber === song.number) {
+        resetForm();
+      }
+      setStatusMessage({
+        text: `Saved & Pushed to GitHub — Deleted Song ${song.number}`,
+      });
+    } catch (err) {
+      setActionError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to delete song on GitHub.'
+      );
+    } finally {
+      setBusy(false);
     }
   };
 
   const handleDownloadBackup = async () => {
     setDownloadNotice(null);
-    setSaveError(null);
+    setActionError(null);
 
     try {
-      const res = await fetch('/songs.txt', { cache: 'no-store' });
-      if (!res.ok) {
-        throw new Error('Could not read current songs.txt.');
+      let currentText = rawSongsTxt;
+      if (!currentText) {
+        const res = await fetch('/songs.txt', { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error('Could not read current songs.txt.');
+        }
+        currentText = await res.text();
       }
-      const currentText = await res.text();
 
       const draftLyrics = lyrics.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
       const draftTitle = (title.trim() || extractDefaultTitleFromLyrics(draftLyrics)).trim();
@@ -292,13 +398,23 @@ export function MasterAdminView({
       let message = 'Downloaded current songs.txt.';
 
       if (draftLyrics && draftTitle) {
-        contentToDownload = appendSongToSongsTxt(currentText, {
-          number: nextSongNumber,
-          title: draftTitle,
-          lyricist: lyricist.trim() || 'Traditional',
-          lyrics: draftLyrics,
-        });
-        message = `Downloaded songs.txt with draft Song ${nextSongNumber} included.`;
+        if (editingSongNumber !== null) {
+          contentToDownload = updateSongInSongsTxt(currentText, {
+            number: editingSongNumber,
+            title: draftTitle,
+            lyricist: lyricist.trim() || 'Traditional',
+            lyrics: draftLyrics,
+          });
+          message = `Downloaded songs.txt with edited Song ${editingSongNumber} included.`;
+        } else {
+          contentToDownload = appendSongToSongsTxt(currentText, {
+            number: nextSongNumber,
+            title: draftTitle,
+            lyricist: lyricist.trim() || 'Traditional',
+            lyrics: draftLyrics,
+          });
+          message = `Downloaded songs.txt with draft Song ${nextSongNumber} included.`;
+        }
       }
 
       const blob = new Blob([contentToDownload], { type: 'text/plain;charset=utf-8' });
@@ -313,7 +429,7 @@ export function MasterAdminView({
 
       setDownloadNotice(message);
     } catch {
-      setSaveError('Failed to generate songs.txt download.');
+      setActionError('Failed to generate songs.txt download.');
     }
   };
 
@@ -364,7 +480,7 @@ export function MasterAdminView({
           <p className="text-sm text-stone-600 dark:text-stone-400 mt-2 leading-relaxed">
             {authMode === 'setup'
               ? 'No MASTER_ADMIN_PASSWORD secret is configured yet. Create an admin password for this session to unlock song publishing.'
-              : 'Enter the admin password to add new Malayalam songs directly to songs.txt.'}
+              : 'Enter the admin password to add, edit, or delete songs in your GitHub repository.'}
           </p>
 
           <form
@@ -437,54 +553,92 @@ export function MasterAdminView({
         </section>
       )}
 
-      {(authMode === 'authenticated' || authMode === 'static-fallback') && (
+      {(authMode === 'authenticated' || authMode === 'static-ready') && (
         <section className="pt-8">
           <div className="pb-6 border-b border-stone-200 dark:border-stone-800">
             <h1 className="font-editorial text-2xl sm:text-3xl font-semibold text-[#1C1917] dark:text-[#F4F1EA]">
-              Add New Song
+              {editingSongNumber !== null ? `Edit Song ${editingSongNumber}` : 'Add New Song'}
             </h1>
             <p className="text-sm text-stone-500 dark:text-stone-400 mt-1 tabular-nums">
-              Currently {songs.length} {songs.length === 1 ? 'song' : 'songs'} in songs.txt
+              {songs.length} {songs.length === 1 ? 'song' : 'songs'} loaded
+              <span aria-hidden="true" className="mx-2">·</span>
+              <span className="font-mono text-xs">
+                {GITHUB_OWNER}/{GITHUB_REPO} ({GITHUB_BRANCH}) · {FILE_PATH}
+              </span>
             </p>
           </div>
 
-          {authMode === 'static-fallback' && (
-            <p className="mt-5 text-sm text-stone-600 dark:text-stone-400 border border-stone-200 dark:border-stone-800 rounded-md px-4 py-3 bg-white/60 dark:bg-[#1A1918]">
-              Static hosting detected: direct server writes to <code className="font-mono">songs.txt</code> are unavailable. Fill out the song below and click <strong>Download songs.txt</strong> to get the updated file.
+          {!repoConfigured && (
+            <p className="mt-5 text-sm text-stone-700 dark:text-stone-300 border border-stone-300 dark:border-stone-700 rounded-md px-4 py-3 bg-white/70 dark:bg-[#1A1918]">
+              Set <code className="font-mono">GITHUB_OWNER</code> and{' '}
+              <code className="font-mono">GITHUB_REPO</code> at the top of{' '}
+              <code className="font-mono">src/config/github.ts</code> to enable direct GitHub commits and auto-sync. You can still use <strong>Download songs.txt</strong> anytime.
             </p>
           )}
 
-          {savedSong && (
+          {/* GitHub Personal Access Token (persisted in localStorage) */}
+          <div className="mt-6 pb-6 border-b border-stone-200 dark:border-stone-800">
+            <div className="flex items-baseline justify-between gap-2 mb-1.5">
+              <label
+                htmlFor="github-token"
+                className="inline-flex items-center gap-1.5 text-sm font-medium text-[#1C1917] dark:text-[#F4F1EA]"
+              >
+                <KeyRound className="w-4 h-4 text-stone-500 dark:text-stone-400" aria-hidden="true" />
+                <span>GitHub Token</span>
+              </label>
+              {githubToken.trim().length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => handleGitHubTokenChange('')}
+                  className="text-xs text-stone-500 dark:text-stone-400 hover:text-[#7C2D12] dark:hover:text-[#E2A856] underline underline-offset-4 cursor-pointer"
+                >
+                  Clear saved token
+                </button>
+              )}
+            </div>
+            <input
+              id="github-token"
+              type="password"
+              value={githubToken}
+              onChange={(e) => handleGitHubTokenChange(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Paste a fine-grained GitHub token with Contents read/write access"
+              className="w-full min-h-[44px] px-3.5 py-2.5 text-sm font-mono rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-[#1C1917] dark:text-[#F4F1EA] placeholder:text-stone-400 dark:placeholder:text-stone-500 placeholder:font-sans"
+            />
+            <p className="text-xs text-stone-500 dark:text-stone-400 mt-1.5">
+              Saved locally in this browser so you only enter it once.
+            </p>
+          </div>
+
+          {statusMessage && (
             <div
               role="status"
               className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-md border border-emerald-300 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-950/40 px-4 py-3 text-sm text-emerald-900 dark:text-emerald-200"
             >
               <span className="inline-flex items-center gap-2">
                 <Check className="w-4 h-4 shrink-0" aria-hidden="true" />
-                <span>
-                  Saved <strong>Song {savedSong.number}</strong> ({savedSong.title}) to songs.txt.
-                </span>
+                <span>{statusMessage.text}</span>
               </span>
-              <a
-                href={`/song/${savedSong.number}`}
-                onClick={(e) => {
-                  if (!e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
-                    e.preventDefault();
-                    onOpenSong(savedSong.number);
-                  }
-                }}
-                className="font-medium underline underline-offset-4 hover:opacity-80 whitespace-nowrap"
-              >
-                View Song {savedSong.number}
-              </a>
+              {statusMessage.songNumber !== undefined && (
+                <a
+                  href={`/song/${statusMessage.songNumber}`}
+                  onClick={(e) => {
+                    if (!e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+                      e.preventDefault();
+                      onOpenSong(statusMessage.songNumber!);
+                    }
+                  }}
+                  className="font-medium underline underline-offset-4 hover:opacity-80 whitespace-nowrap"
+                >
+                  View Song {statusMessage.songNumber}
+                </a>
+              )}
             </div>
           )}
 
           {downloadNotice && (
-            <p
-              role="status"
-              className="mt-4 text-sm text-stone-700 dark:text-stone-300"
-            >
+            <p role="status" className="mt-4 text-sm text-stone-700 dark:text-stone-300">
               {downloadNotice}
             </p>
           )}
@@ -502,7 +656,7 @@ export function MasterAdminView({
                   id="song-number"
                   type="text"
                   readOnly
-                  value={nextSongNumber}
+                  value={displaySongNumber}
                   className="w-full min-h-[44px] px-3.5 py-2.5 text-base tabular-nums rounded-md border border-stone-200 dark:border-stone-800 bg-stone-100/80 dark:bg-stone-900/70 text-stone-600 dark:text-stone-400 cursor-default"
                 />
               </div>
@@ -512,7 +666,8 @@ export function MasterAdminView({
                   htmlFor="song-lyricist"
                   className="block text-sm font-medium text-[#1C1917] dark:text-[#F4F1EA] mb-1.5"
                 >
-                  Lyricist <span className="font-normal text-stone-500 dark:text-stone-400">(optional)</span>
+                  Lyricist{' '}
+                  <span className="font-normal text-stone-500 dark:text-stone-400">(optional)</span>
                 </label>
                 <input
                   id="song-lyricist"
@@ -575,25 +730,43 @@ export function MasterAdminView({
               />
             </div>
 
-            {saveError && (
+            {actionError && (
               <p role="alert" className="text-sm text-red-700 dark:text-red-400">
-                {saveError}
+                {actionError}
               </p>
             )}
 
             <div className="flex flex-wrap items-center gap-3 pt-2">
               <button
                 type="submit"
-                disabled={saving}
+                disabled={busy}
                 className="inline-flex items-center gap-2 px-5 py-2.5 min-h-[44px] text-sm font-medium rounded-md bg-[#7C2D12] hover:bg-[#66240E] dark:bg-[#D97706] dark:hover:bg-[#B45309] text-white dark:text-[#111110] disabled:opacity-50 transition-colors duration-150 whitespace-nowrap cursor-pointer"
               >
                 <Save className="w-4 h-4" aria-hidden="true" />
-                <span>{saving ? 'Saving to songs.txt…' : `Save Song ${nextSongNumber}`}</span>
+                <span>
+                  {busy
+                    ? 'Pushing to GitHub…'
+                    : editingSongNumber !== null
+                      ? `Update Song ${editingSongNumber} on GitHub`
+                      : `Save Song ${nextSongNumber} to GitHub`}
+                </span>
               </button>
+
+              {editingSongNumber !== null && (
+                <button
+                  type="button"
+                  onClick={resetForm}
+                  disabled={busy}
+                  className="inline-flex items-center px-4 py-2.5 min-h-[44px] text-sm font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 whitespace-nowrap cursor-pointer"
+                >
+                  Cancel Edit
+                </button>
+              )}
 
               <button
                 type="button"
                 onClick={handleDownloadBackup}
+                disabled={busy}
                 className="inline-flex items-center gap-2 px-4 py-2.5 min-h-[44px] text-sm font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-[#1C1917] dark:text-[#F4F1EA] hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 whitespace-nowrap cursor-pointer"
               >
                 <Download className="w-4 h-4 text-stone-500 dark:text-stone-400" aria-hidden="true" />
@@ -601,6 +774,86 @@ export function MasterAdminView({
               </button>
             </div>
           </form>
+
+          {/* Existing Songs — Edit or Delete Directly on GitHub */}
+          {songs.length > 0 && (
+            <div className="mt-12 pt-8 border-t border-stone-200 dark:border-stone-800">
+              <h2 className="font-editorial text-xl font-semibold text-[#1C1917] dark:text-[#F4F1EA]">
+                Manage Existing Songs
+              </h2>
+              <p className="text-xs text-stone-500 dark:text-stone-400 mt-1">
+                Edit or delete a song and commit the updated songs.txt directly to GitHub.
+              </p>
+
+              <ul className="mt-4 border-y border-stone-200 dark:border-stone-800 divide-y divide-stone-200/90 dark:divide-stone-800/90">
+                {songs.map((song) => {
+                  const isDeletingThis = confirmDeleteNumber === song.number;
+                  return (
+                    <li
+                      key={song.number}
+                      className="py-3.5 flex flex-wrap items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm sm:text-base font-medium text-[#1C1917] dark:text-[#F4F1EA] truncate">
+                          <span className="tabular-nums text-[#7C2D12] dark:text-[#E2A856] mr-2">
+                            {song.number}.
+                          </span>
+                          {song.malayalamTitle || song.title}
+                        </p>
+                        <p className="text-xs text-stone-500 dark:text-stone-400 truncate mt-0.5">
+                          {song.lyricist}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        {isDeletingThis ? (
+                          <>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleDeleteSong(song)}
+                              className="px-3 py-1.5 min-h-[36px] text-xs font-medium rounded-md bg-red-700 hover:bg-red-800 text-white disabled:opacity-50 transition-colors duration-150 whitespace-nowrap cursor-pointer"
+                            >
+                              {busy ? 'Deleting…' : 'Confirm Delete'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => setConfirmDeleteNumber(null)}
+                              className="px-3 py-1.5 min-h-[36px] text-xs font-medium rounded-md border border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 whitespace-nowrap cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleStartEdit(song)}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-[#1C1917] dark:text-[#F4F1EA] hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50 transition-colors duration-150 whitespace-nowrap cursor-pointer"
+                            >
+                              <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
+                              <span>Edit</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => setConfirmDeleteNumber(song.number)}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1A1918] text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-50 transition-colors duration-150 whitespace-nowrap cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                              <span>Delete</span>
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
         </section>
       )}
     </main>
