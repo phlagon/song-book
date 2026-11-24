@@ -1,0 +1,6 @@
+{
+  "name": "Malayalam Christian Song Lyrics",
+  "description": "A clean, fast-loading, mobile-responsive Malayalam Christian hymnal and song lyrics reader that dynamically loads and parses songs from songs.txt.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
