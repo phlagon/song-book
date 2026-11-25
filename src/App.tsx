@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Lock } from 'lucide-react';
 import { Header } from './components/Header';
 import { MasterAdminView } from './components/MasterAdminView';
 import { SongDetailView } from './components/SongDetailView';
@@ -10,6 +11,7 @@ import {
   readSyncedSongs,
   writeSyncedSongs,
 } from './utils/githubSync';
+import { isNativeApp } from './utils/platform';
 import { toViewSongs } from './utils/songsDataCodec';
 
 const DEFAULT_FONT_SIZE = 20;
@@ -162,6 +164,16 @@ export default function App() {
     window.scrollTo({ top: 0 });
   }, []);
 
+  const navigateToMaster = useCallback(() => {
+    if (window.location.pathname !== '/master') {
+      window.history.pushState({ view: 'master' }, '', '/master');
+    }
+    setRoute({ view: 'master' });
+    window.scrollTo({ top: 0 });
+  }, []);
+
+  const showWebMasterLogin = useMemo(() => !isNativeApp(), []);
+
   const currentSongIndex = useMemo(() => {
     if (activeSongNumber === null) return -1;
     return songs.findIndex((s) => s.number === activeSongNumber);
@@ -252,16 +264,18 @@ export default function App() {
       </div>
 
       <footer className="border-t border-stone-200 dark:border-stone-800 mt-12">
-        <div className="max-w-4xl mx-auto px-5 sm:px-8 py-5 flex flex-wrap items-center justify-between gap-2 text-xs text-stone-500 dark:text-stone-400">
+        <div className="max-w-4xl mx-auto px-5 sm:px-8 py-5 flex flex-wrap items-center justify-between gap-3 text-xs text-stone-500 dark:text-stone-400">
           <span>Malayalam Christian Song Lyrics</span>
-          <a
-            href="/songs.txt"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:text-[#7C2D12] dark:hover:text-[#E2A856] underline underline-offset-4 transition-colors duration-150"
-          >
-            View songs.txt
-          </a>
+          {showWebMasterLogin && route.view !== 'master' && (
+            <button
+              type="button"
+              onClick={navigateToMaster}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[40px] text-xs font-medium rounded-md border border-stone-300 dark:border-stone-700 bg-white/70 dark:bg-[#1A1918] text-stone-700 dark:text-stone-300 hover:text-[#7C2D12] dark:hover:text-[#E2A856] hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Lock className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Master Login</span>
+            </button>
+          )}
         </div>
       </footer>
     </div>
